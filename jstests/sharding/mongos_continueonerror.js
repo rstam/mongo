@@ -17,6 +17,7 @@ var enableSharding = function(mongos, database, collection) {
     var admin = mongos.getDB("admin");
     admin.runCommand({ enableSharding : database._name });
     admin.runCommand({ shardCollection : collection._fullName, key : { _sk : 1 }});
+    collection.ensureIndex({ x : 1, y : 1 }); // used to create errors in mongod
 }
 
 var chooseRandomIndexes = function(length, count) {
@@ -49,14 +50,16 @@ var createErrorsInBatch = function(batch, options) {
             indexes[indexes.length - 1] = batch.length - 1;
         }
 
+        print("Error indexes: " + JSON.stringify(indexes));
         for (var index in indexes) {
             if (options.errorLocation == "mongos") {
                 // removing the shard key causes a missing shard key error in mongos
                 delete batch[index]._sk;
             }
-            else if (options.errorLocation == "mongod")  {
-                // setting the _id to -1 causes a duplicate key error in mongod
-                batch[index]._id = -1;
+            else if (options.errorLocation == "mongod") {
+                // setting x and y to arrays causes an indexing error in mongod
+                batch[index].x = [1];
+                batch[index].y = [1];
             }
             else {
                 assert(false, "invalid errorLocation");
@@ -72,8 +75,6 @@ var randomNumberBetween = function(min, max) {
 var resetCollection = function(collection) {
     print("resetting collection");
     collection.remove(); // use remove instead of drop so collection will still be sharded
-    collection.insert({ _id : -1, _sk : -1 }); // _id = -1 is used to create duplicate keys
-    print("count({ _id : -1 }) = " + collection.count({ _id : -1 }));
 }
 
 var runTests = function(mongos, options) {
@@ -104,9 +105,6 @@ var runTests = function(mongos, options) {
 var scrambleInteger = function(n) {
     // only works for values up to 3 bytes long
     return ((n << 16) & 0xff0000) | (n & 0xff00) | ((n >> 16) & 0xff);
-}
-
-var setupSharding = function(mongos) {
 }
 
 var startCluster = function(options) {
@@ -161,8 +159,14 @@ var testBatch = function(collection, nextId, options) {
 
     createErrorsInBatch(batch, options);
 
+    var countBefore = collection.count();
     var insertFlags = options.continueOnError ? 1 : 0;
     collection.insert(batch, insertFlags);
+    var lastError = collection.getDB().getLastError();
+    var countAfter = collection.count();
+    var documentsInserted = countAfter - countBefore;
+    print("insert batch inserted " + documentsInserted + " out of " + batch.length + " and last error was: " + lastError);
+
     verifyBatch(collection, batch, options);
 
     return id;
@@ -173,7 +177,7 @@ var testBatches = function(collection, options) {
         iterations : 100,
         batchSizes : { min : 1000, max : 1000000 },
         documentSizes : { min : 1000, max : 20000 },
-        numberOfErrors  : { min : 0, max : 10 },
+        numberOfErrors : { min : 0, max : 10 },
         continueOnError : false
     };
     options = applyDefaults(options, defaults);
@@ -182,10 +186,11 @@ var testBatches = function(collection, options) {
     print("iterations: " + options.iterations);
     print("batchSizes: " + JSON.stringify(options.batchSizes));
     print("documentSizes: " + JSON.stringify(options.documentSizes));
-    print("numberOfErrors: " + options.numberOfErrors);
+    print("numberOfErrors: " + JSON.stringify(options.numberOfErrors));
     print("continueOnError: " + options.continueOnError);
     print("firstDocumentShouldHaveError: " + options.firstDocumentShouldHaveError);
     print("lastDocumentShouldHaveError: " + options.lastDocumentShouldHaveError);
+    print("errorLocation: " + options.errorLocation);
     print("scrambleShardKey: " + options.scrambleShardKey);
 
     var nextId = 1;
@@ -196,23 +201,29 @@ var testBatches = function(collection, options) {
 }
 
 var verifyBatch = function(collection, batch, options) {
-    var count = collection.count({ _id : -1 });
-    assert(count == 1, "somehow the collection ended up with " + count + " documents matching { _id : -1 }");
-
     var afterFirstError = false;
 
     for (var i = 0; i < batch.length; i++) {
         var document = batch[i];
-        var count = collection.count({ _id : document._id });
+        count = collection.find({ _id : document._id }).toArray().length; // count client side to get accurate count during migrations
 
-        if (document._id == -1) {
-            assert(count == 1);
+        if (document.x) {
+            // mongod should have rejected the document because x and y are both arrays (can't index two arrays)
+            assert(count == 0);
             afterFirstError = true;
         } else if (document._sk === undefined) {
+            // mongos should have rejected the document because it is missing the shard key
             assert(count == 0);
             afterFirstError = true;
         } else {
-            assert(count == afterFirstError && !options.continueOnError ? 0 : 1);
+            var expectedCount = (afterFirstError && !options.continueOnError) ? 0 : 1;
+            if (count != expectedCount) {
+                print("_id = " + document._id);
+                print("count = " + collection.count());
+                print("afterFirstError = " + afterFirstError);
+                print("continueOnError = " + options.continueOnError);
+            }
+            assert(count == expectedCount, "expected count to be " + expectedCount + " but it was " + count);
         }
     }
 
@@ -224,10 +235,11 @@ var main = function(options) {
 
     var options = {
         sharding : {
+            shards : 2,
             config : 3
         },
         batches : {
-            iterations : 2,
+            iterations : 10,
             batchSizes : { min : 1, max : 1000000 },
             documentSizes : { min : 1000, max : 2000 },
             numberOfErrors : { min : 0, max : 10 }
